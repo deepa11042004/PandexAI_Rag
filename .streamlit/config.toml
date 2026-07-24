@@ -1,0 +1,19 @@
+[theme]
+base = "dark"
+primaryColor = "#C17F3E"
+backgroundColor = "#17140F"
+secondaryBackgroundColor = "#201B14"
+textColor = "#F3EAD9"
+font = "sans serif"
+
+[server]
+maxUploadSize = 50
+enableXsrfProtection = true
+
+[client]
+# This app has its own fully custom sidebar (brand header, nav links via st.page_link) - the
+# default auto-generated multipage nav list would otherwise render above it, unthemed.
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false

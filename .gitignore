@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.sessions/
+.vector_indexes/
+chroma_db/
+uploads/
+logs/
+.streamlit/secrets.toml
+venv/
+.claude/
