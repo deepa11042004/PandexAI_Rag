@@ -26,7 +26,7 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from openai import AuthenticationError, OpenAI, OpenAIError
 
-from backend.config import get_settings
+from config import get_settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)

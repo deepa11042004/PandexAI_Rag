@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from backend.config import get_settings
+from config import get_settings
 from utils.helpers import clean_text
 
 FILE_EXTENSION_TYPES = {
@@ -84,7 +84,7 @@ def load_file(filename: str, raw_bytes: bytes) -> LoadResult:
     """Extract, clean, and chunk an uploaded file based on its extension."""
     # Imported lazily to avoid circular imports and to keep optional OCR deps out of the hot path
     # for users who never upload images.
-    from backend.loaders import image_loader, office_loaders, text_loaders
+    from loaders import image_loader, office_loaders, text_loaders
 
     extension = get_extension(filename)
     source_type = FILE_EXTENSION_TYPES.get(extension)
@@ -109,14 +109,14 @@ def load_file(filename: str, raw_bytes: bytes) -> LoadResult:
 
 
 def load_website(url: str) -> LoadResult:
-    from backend.loaders.website_loader import scrape
+    from loaders.website_loader import scrape
 
     raw_text, title = scrape(url)
     return build_chunks(raw_text, name=title, source_type="website", extra_metadata={"url": url})
 
 
 def load_youtube(url: str) -> LoadResult:
-    from backend.loaders.youtube_loader import fetch_transcript
+    from loaders.youtube_loader import fetch_transcript
 
     raw_text, title = fetch_transcript(url)
     return build_chunks(raw_text, name=title, source_type="youtube", extra_metadata={"url": url})

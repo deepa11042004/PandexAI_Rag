@@ -12,7 +12,7 @@ import io
 import pytesseract
 from PIL import Image
 
-from backend.config import get_settings
+from config import get_settings
 
 _configured = False
 

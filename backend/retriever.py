@@ -10,8 +10,8 @@ from dataclasses import dataclass
 
 from langchain_core.documents import Document
 
-from backend.config import get_settings
-from backend.vector_store import VectorStoreManager
+from config import get_settings
+from vector_store import VectorStoreManager
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 

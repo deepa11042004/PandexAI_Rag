@@ -64,6 +64,7 @@ class SessionSettings(BaseModel):
     chat_model: str | None = None
     retrieval_top_k: int | None = None
     rerank_top_k: int | None = None
+    mcp_math_enabled: bool | None = None
 
 
 class TranscriptionResponse(BaseModel):

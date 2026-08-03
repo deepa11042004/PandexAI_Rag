@@ -13,8 +13,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from backend.config import get_settings
-from backend.session_manager import connect, derive_title, db_path
+from config import get_settings
+from session_manager import connect, derive_title, db_path
 from utils.helpers import new_id, now_iso
 from utils.logger import get_logger
 

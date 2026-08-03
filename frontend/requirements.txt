@@ -1,0 +1,10 @@
+# --- UI framework --------------------------------------------------------------
+streamlit>=1.38.0
+httpx>=0.27.0
+Pillow>=10.4.0
+
+# --- Chat export (PDF / TXT / JSON) ---------------------------------------------
+fpdf2>=2.7.9
+
+# --- Token/cost accounting (used by utils/helpers.py) ---------------------------
+tiktoken>=0.7.0

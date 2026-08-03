@@ -14,14 +14,15 @@ import re
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-from backend.config import get_settings
-from backend.graph import NOT_FOUND_MESSAGE, run_retrieval_graph
-from backend.llm_provider import astream_with_fallback, get_embeddings_client
-from backend.loaders import base as loaders
-from backend.loaders.website_loader import WebsiteExtractionError
-from backend.loaders.youtube_loader import YoutubeExtractionError
-from backend.session_manager import SessionManager, delete_session_file, get_session
-from backend.vector_store import VectorStoreManager, delete_session_collection
+from config import get_settings
+from graph import NOT_FOUND_MESSAGE, run_retrieval_graph
+from llm_provider import astream_with_fallback, get_embeddings_client
+from loaders import base as loaders
+from loaders.website_loader import WebsiteExtractionError
+from loaders.youtube_loader import YoutubeExtractionError
+from mcp_math_client import classify_query, evaluate_math_query
+from session_manager import SessionManager, delete_session_file, get_session
+from vector_store import VectorStoreManager, delete_session_collection
 from utils.helpers import content_hash, count_tokens, estimate_cost, new_id, now_iso
 from utils.logger import get_logger
 
@@ -245,6 +246,38 @@ async def stream_chat(session_id: str, question: str) -> AsyncIterator[dict[str,
         async for event in _stream_and_record(session, messages, preferred_provider, model_override, citations=[]):
             yield event
         return
+
+    mcp_math_enabled = session.settings_overrides.get("mcp_math_enabled", True)
+    route = classify_query(question) if mcp_math_enabled else "rag"
+    if route in {"math", "mixed"}:
+        if route == "math":
+            answer = await evaluate_math_query(question)
+            if answer is not None:
+                session.append_message({"role": "assistant", "content": answer, "citations": [], "timestamp": now_iso()})
+                yield {"type": "token", "data": answer}
+                yield {"type": "done", "citations": [], "usage": {}, "provider": "", "model": ""}
+                return
+        else:
+            history_pairs = session.chat_history_pairs(settings.max_history_turns)
+            rerank_top_k_override = session.settings_overrides.get("rerank_top_k")
+            source_ids = [s["id"] for s in session.sources]
+
+            try:
+                state = await run_retrieval_graph(
+                    question, history_pairs, manager, preferred_provider, rerank_top_k_override, source_ids
+                )
+            except Exception as exc:  # noqa: BLE001 - surface retrieval failures cleanly to the client
+                logger.exception("Retrieval graph failed for session %s", session_id)
+                yield {"type": "error", "message": f"Retrieval failed: {exc}"}
+                return
+
+            if state["has_context"]:
+                answer = await evaluate_math_query(question, state["context"])
+                if answer is not None:
+                    session.append_message({"role": "assistant", "content": answer, "citations": state["citations"], "timestamp": now_iso()})
+                    yield {"type": "token", "data": answer}
+                    yield {"type": "done", "citations": state["citations"], "usage": {}, "provider": "", "model": ""}
+                    return
 
     if manager.count() == 0:
         answer = NOT_FOUND_MESSAGE

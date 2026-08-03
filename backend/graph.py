@@ -12,10 +12,10 @@ from typing import Any, TypedDict
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from backend import retriever
-from backend.config import get_settings
-from backend.llm_provider import build_llm, fallback_order
-from backend.vector_store import VectorStoreManager
+import retriever
+from config import get_settings
+from llm_provider import build_llm, fallback_order
+from vector_store import VectorStoreManager
 from utils.logger import get_logger
 
 logger = get_logger(__name__)

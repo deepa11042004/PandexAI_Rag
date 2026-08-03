@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from backend.config import get_settings
+from config import get_settings
 from utils.helpers import now_iso
 
 _TITLE_MAX_LEN = 60

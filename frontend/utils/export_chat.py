@@ -57,17 +57,20 @@ def export_chat_to_pdf(chat_history: list[dict[str, Any]]) -> bytes:
         role = "You" if message["role"] == "user" else "Assistant"
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_text_color(80, 40, 160) if role == "You" else pdf.set_text_color(20, 120, 100)
-        pdf.multi_cell(0, 7, _sanitize(f"{role}:"))
+        # multi_cell's default new_x is XPos.RIGHT (not LMARGIN) in this fpdf2 version, which
+        # strands the cursor at the right margin and makes the *next* multi_cell fail with
+        # "not enough horizontal space to render a single character" - see header() above.
+        pdf.multi_cell(0, 7, _sanitize(f"{role}:"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(20, 20, 20)
-        pdf.multi_cell(0, 6, _sanitize(message.get("content", "")))
+        pdf.multi_cell(0, 6, _sanitize(message.get("content", "")), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
         citations = message.get("citations") or []
         if citations:
             pdf.set_font("Helvetica", "I", 9)
             pdf.set_text_color(110, 110, 110)
-            pdf.multi_cell(0, 5, _sanitize("Sources: " + ", ".join(citations)))
+            pdf.multi_cell(0, 5, _sanitize("Sources: " + ", ".join(citations)), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
         pdf.ln(3)
 

@@ -1,6 +1,6 @@
 """FastAPI backend entrypoint: async REST + SSE-streaming endpoints for the RAG pipeline.
 
-Run with: uvicorn backend.main:app --reload
+Run with (from inside this backend/ folder): uvicorn main:app --reload
 """
 
 from __future__ import annotations
@@ -13,10 +13,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from backend import history_store, rag_pipeline
-from backend.config import get_settings
-from backend.llm_provider import fallback_order, transcribe_audio, validate_api_key
-from backend.models import (
+import history_store
+import rag_pipeline
+from config import get_settings
+from llm_provider import fallback_order, transcribe_audio, validate_api_key
+from models import (
     AddUrlRequest,
     AddYoutubeRequest,
     ChatHistoryResponse,
@@ -33,7 +34,7 @@ from backend.models import (
     TokenUsage,
     TranscriptionResponse,
 )
-from backend.session_manager import get_session
+from session_manager import get_session
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -63,7 +64,7 @@ async def on_startup() -> None:
     if settings.embedding_provider == "local":
         # Load (and on first-ever run, download) the local embedding model now, in a thread so it
         # doesn't block the event loop, rather than paying that cost on a user's first message.
-        from backend.llm_provider import get_embeddings_client
+        from llm_provider import get_embeddings_client
 
         logger.info("Warming local embedding model...")
         await run_in_threadpool(lambda: get_embeddings_client().embed_query("warmup"))

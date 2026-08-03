@@ -39,11 +39,20 @@ server-side in the backend's `.env`; the browser never sees them.
 
 ## Project Structure
 
+Backend and frontend are two fully independent, self-contained projects - each has its own
+virtual environment, its own `requirements.txt`, and its own copy of the small shared `utils/`
+helpers (no cross-folder imports). Run/deploy either one on its own.
+
 ```
 project/
 ├── frontend/
 │   ├── streamlit_app.py        # UI only - talks to the backend over HTTP/SSE
-│   └── assets/                  # Mascot image + style.css (frontend-only)
+│   ├── pages/                   # Additional Streamlit pages (e.g. Chat History)
+│   ├── assets/                  # Mascot image + style.css (frontend-only)
+│   ├── .streamlit/config.toml   # Theme + server config
+│   ├── utils/                    # export_chat.py, helpers.py (frontend's own copy)
+│   ├── requirements.txt
+│   └── Dockerfile
 ├── backend/
 │   ├── main.py                 # FastAPI app (async endpoints, SSE chat stream)
 │   ├── rag_pipeline.py         # Orchestrates ingestion + chat end-to-end
@@ -51,16 +60,18 @@ project/
 │   ├── retriever.py            # Vector search + hybrid lexical rerank
 │   ├── vector_store.py         # ChromaDB per-session collection wrapper
 │   ├── llm_provider.py         # Local embeddings + Groq/OpenRouter/OpenAI chat with fallback
+│   ├── mcp_math_client.py       # Routes math questions to an external MCP math server
 │   ├── session_manager.py      # Per-session JSON persistence (sources/chat/usage/settings)
 │   ├── config.py                # Env-driven settings (pydantic-settings)
 │   ├── models.py                # Pydantic request/response schemas
-│   └── loaders/                 # One module per source type + shared chunking logic
-├── chroma_db/                   # Persisted vector store (gitignored, auto-created)
-├── uploads/                      # (reserved for on-disk staging; currently in-memory, auto-created)
-├── utils/                        # Shared, framework-agnostic helpers (both frontend & backend)
-├── .env.example
-├── requirements.txt
-├── Dockerfile.backend / Dockerfile.frontend / docker-compose.yml
+│   ├── loaders/                 # One module per source type + shared chunking logic
+│   ├── utils/                    # logger.py, helpers.py (backend's own copy)
+│   ├── tests/                    # pytest suite (run with `python -m pytest` from here)
+│   ├── chroma_db/ uploads/ .sessions/ logs/   # gitignored, auto-created at runtime
+│   ├── .env.example / .env
+│   ├── requirements.txt
+│   └── Dockerfile
+├── docker-compose.yml
 └── README.md
 ```
 
@@ -80,9 +91,10 @@ chat. Embeddings are local and need **no key at all** (see step 3).
 
 (Skip this if you don't need image ingestion - every other source type works without it.)
 
-### 3. Create a virtual environment and install dependencies
+### 3. Set up the backend (its own venv + dependencies)
 
 ```powershell
+cd backend
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
@@ -91,7 +103,7 @@ pip install -r requirements.txt
 This installs `sentence-transformers` (local embeddings) which pulls in PyTorch - a larger,
 slower install than a pure API-only setup, but it's what makes embeddings free and keyless.
 
-### 4. Configure environment variables
+### 4. Configure environment variables (backend only - the frontend needs no API keys)
 
 ```powershell
 copy .env.example .env
@@ -108,29 +120,40 @@ an additional fallback or prefer their models.
 The local embedding model (~80MB) downloads automatically the first time the backend embeds a
 document - that first upload will take longer than subsequent ones.
 
-### 5. Run both processes
+### 5. Set up the frontend (its own venv + dependencies)
 
-Terminal 1 (backend):
+In a separate terminal:
 ```powershell
+cd frontend
+python -m venv venv
 venv\Scripts\activate
-uvicorn backend.main:app --reload --port 8000
+pip install -r requirements.txt
 ```
 
-Terminal 2 (frontend):
+### 6. Run both processes
+
+Terminal 1 (backend - from inside `backend/`, venv activated):
 ```powershell
-venv\Scripts\activate
-streamlit run frontend/streamlit_app.py
+uvicorn main:app --reload --port 8000
+```
+
+Terminal 2 (frontend - from inside `frontend/`, venv activated):
+```powershell
+streamlit run streamlit_app.py
 ```
 
 Open the Streamlit URL (default `http://localhost:8501`). The sidebar shows backend connection
-status and which providers are configured - no API key entry in the browser.
+status and which providers are configured - no API key entry in the browser. If the backend runs
+somewhere other than `http://localhost:8000`, set `BACKEND_URL` as an environment variable before
+starting the frontend.
 
-### Docker (alternative to steps 3-5)
+### Docker (alternative to steps 3-6)
 
 ```bash
 docker compose up --build
 ```
-Frontend on `http://localhost:8501`, backend on `http://localhost:8000`. Both share `.env`.
+Frontend on `http://localhost:8501`, backend on `http://localhost:8000`. Backend reads
+`backend/.env`; the frontend needs no secrets.
 
 ## Notes
 
@@ -143,7 +166,9 @@ Frontend on `http://localhost:8501`, backend on `http://localhost:8000`. Both sh
 - **Re-ranking is heuristic, not a second ML model** (0.75×vector-distance + 0.25×lexical-overlap,
   see `backend/retriever.py`) - since embeddings already pull in PyTorch, a cross-encoder reranker
   would work fine here too if you want to add one later.
-- Each browser tab gets its own session (a `?sid=` query param), with its own ChromaDB
-  collection and JSON-persisted chat/source/usage state under `.sessions/`.
+- Each browser tab gets its own session, with its own ChromaDB collection and persisted
+  chat/source/usage state under `.sessions/`. Session identity lives only in Streamlit's
+  `session_state`, not the URL, so refreshing the page always starts a brand-new, empty
+  conversation - to resume a past one, open it from the Chat History page instead.
 - Streamlit's native chrome follows `.streamlit/config.toml`'s dark base theme; the in-app
   light/dark toggle re-themes all custom chat/sidebar UI at runtime.

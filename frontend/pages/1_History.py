@@ -12,16 +12,13 @@ from __future__ import annotations
 
 import html
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 import streamlit as st
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from utils.helpers import new_id  # noqa: E402
+from utils.helpers import new_id
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 HTTP_TIMEOUT = 10.0
@@ -118,7 +115,7 @@ def _open_session(session_id: str) -> None:
     st.session_state.history_loaded = False
     st.session_state.chat_history = []
     st.session_state.sources = []
-    st.switch_page("streamlit_app.py", query_params={"sid": session_id})
+    st.switch_page("streamlit_app.py")
 
 
 @st.dialog("Delete conversation")

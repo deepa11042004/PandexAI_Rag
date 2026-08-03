@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     # --- OCR -------------------------------------------------------------------------
     tesseract_cmd: str = ""  # optional explicit path to tesseract.exe on Windows
 
+    # --- MCP math server -----------------------------------------------------------
+    mcp_math_server_command: str = ""
+    mcp_math_server_args: str = ""
+    mcp_math_timeout_seconds: float = 10.0
+
     # --- Misc --------------------------------------------------------------------
     log_level: str = "INFO"
 

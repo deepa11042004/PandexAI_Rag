@@ -13,18 +13,14 @@ import io
 import json
 import os
 import re
-import sys
 from pathlib import Path
 
 import httpx
 import streamlit as st
 from PIL import Image
 
-# Make the sibling `utils/` package importable when run as `streamlit run frontend/streamlit_app.py`.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from utils.export_chat import export_chat_to_json, export_chat_to_pdf, export_chat_to_text  # noqa: E402
-from utils.helpers import format_file_size, new_id  # noqa: E402
+from utils.export_chat import export_chat_to_json, export_chat_to_pdf, export_chat_to_text
+from utils.helpers import format_file_size, new_id
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 HTTP_TIMEOUT = 8.0  # status/GET calls should fail fast rather than freeze the page if the backend is down
@@ -177,12 +173,10 @@ def init_state() -> None:
 
 init_state()
 
-_query_sid = st.query_params.get("sid")
-if _query_sid:
-    st.session_state.session_id = _query_sid
-else:
-    st.query_params["sid"] = st.session_state.session_id
-
+# Session identity lives purely in st.session_state, not the URL - a browser refresh gets a
+# brand-new session_id (empty chat) rather than resurrecting whatever was last active. Jumping
+# to a specific past conversation (Chat History page's "View") sets session_id/history_loaded
+# directly before switching pages, so it doesn't depend on a `sid` query param round-trip either.
 if not st.session_state.history_loaded:
     # Only mark this done once both calls actually succeed - flipping the flag unconditionally
     # meant a single transient failure (e.g. the backend still busy loading its embedding model
@@ -298,7 +292,7 @@ def render_sidebar() -> None:
                 '<span class="status-badge disconnected"><span class="status-dot"></span>Backend unreachable</span>',
                 unsafe_allow_html=True,
             )
-            st.caption(f"Could not reach {BACKEND_URL}. Is `uvicorn backend.main:app` running?")
+            st.caption(f"Could not reach {BACKEND_URL}. Is `uvicorn main:app` running (from backend/)?")
 
         if not backend_up:
             return  # nothing below here works without the backend - stop making doomed requests
@@ -313,6 +307,12 @@ def render_sidebar() -> None:
             )
             chosen_model = st.text_input("Model override (optional)", value=current.get("chat_model") or "")
             top_k = st.slider("Rerank top-k (chunks used per answer)", 1, 10, current.get("rerank_top_k") or 8)
+            mcp_enabled = st.toggle(
+                "Enable MCP math server",
+                value=current.get("mcp_math_enabled") if current.get("mcp_math_enabled") is not None else True,
+                help="When off, math/calculation questions are answered from your documents like any other "
+                "question instead of being routed to the MCP math server.",
+            )
             if st.button("Save settings", use_container_width=True):
                 api_post(
                     f"/settings/{st.session_state.session_id}",
@@ -320,6 +320,7 @@ def render_sidebar() -> None:
                         "llm_provider": chosen_provider,
                         "chat_model": chosen_model or None,
                         "rerank_top_k": top_k,
+                        "mcp_math_enabled": mcp_enabled,
                     },
                 )
                 st.toast("Settings saved.", icon="✅")
