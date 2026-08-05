@@ -1,11 +1,10 @@
-"""PandexAI - Chat History page: search, sort, filter, and page through every past conversation,
-resume one (View), or permanently delete it.
+"""PandexAI - Chat History page: every past conversation for this local user, backed by MongoDB
+(`GET /chats/{user_id}`), with search, open/resume, rename, and delete.
 
 Kept deliberately separate from the (already large) main chat script - this page only ever talks
-to the backend's `/api/chat-history*` endpoints, never the RAG/chat ones. Card metadata (title,
-timestamps, model, tokens, cost) is loaded cheaply via the list endpoint; a conversation's full
-message history is only fetched when the user actually clicks View (which hands off to the main
-chat page, reusing its existing history-loading + rendering code).
+to the backend's `/chats/{user_id}` and `/chat/{chat_id}` endpoints, never the RAG/ingestion ones.
+A conversation's full message history is only fetched when the user actually clicks Open (which
+hands off to the main chat page, reusing its existing history-loading + rendering code).
 """
 
 from __future__ import annotations
@@ -18,25 +17,15 @@ from pathlib import Path
 import httpx
 import streamlit as st
 
-from utils.helpers import new_id
+from utils.user_store import get_or_create_user
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 HTTP_TIMEOUT = 10.0
-PAGE_SIZE = 9
-
-SORT_OPTIONS = {"Recently Updated": "updated", "Newest": "newest", "Oldest": "oldest"}
 
 st.set_page_config(page_title="PandexAI - History", page_icon="🐼", layout="wide", initial_sidebar_state="expanded")
 
 st.session_state.setdefault("theme", "dark")
-st.session_state.setdefault("session_id", new_id())
-st.session_state.setdefault("hist_items", [])
-st.session_state.setdefault("hist_page", 0)
-st.session_state.setdefault("hist_has_more", True)
-st.session_state.setdefault("hist_total", 0)
-st.session_state.setdefault("hist_available_models", [])
-st.session_state.setdefault("hist_filters_sig", None)
-st.session_state.setdefault("hist_bootstrapped", False)
+st.session_state.setdefault("user_id", get_or_create_user()["user_id"])
 
 
 def _load_css() -> str:
@@ -53,45 +42,29 @@ st.components.v1.html(
 # ----------------------------------------------------------------------------
 # Backend calls
 # ----------------------------------------------------------------------------
-def _fetch_page(page: int, filters: dict) -> dict | None:
+def _fetch_chats(user_id: str) -> list[dict]:
     try:
-        resp = httpx.get(
-            f"{BACKEND_URL}/api/chat-history",
-            params={**filters, "page": page, "page_size": PAGE_SIZE},
-            timeout=HTTP_TIMEOUT,
-        )
+        resp = httpx.get(f"{BACKEND_URL}/chats/{user_id}", timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
-        return resp.json()
+        return resp.json()["chats"]
     except httpx.HTTPError as exc:
         st.error(f"Could not reach the backend: {exc}")
-        return None
+        return []
 
 
-def _create_conversation() -> str | None:
+def _rename_chat(chat_id: str, title: str) -> bool:
     try:
-        resp = httpx.post(f"{BACKEND_URL}/api/chat-history", timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()["id"]
-    except httpx.HTTPError as exc:
-        st.error(f"Could not start a new conversation: {exc}")
-        return None
-
-
-def _update_pin(conversation_id: str, pinned: bool) -> bool:
-    try:
-        resp = httpx.put(
-            f"{BACKEND_URL}/api/chat-history/{conversation_id}", json={"pinned": pinned}, timeout=HTTP_TIMEOUT
-        )
+        resp = httpx.patch(f"{BACKEND_URL}/chat/{chat_id}", json={"title": title}, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
         return True
     except httpx.HTTPError as exc:
-        st.error(f"Could not update conversation: {exc}")
+        st.error(f"Could not rename conversation: {exc}")
         return False
 
 
-def _delete_conversation(conversation_id: str) -> bool:
+def _delete_chat(chat_id: str) -> bool:
     try:
-        resp = httpx.delete(f"{BACKEND_URL}/api/chat-history/{conversation_id}", timeout=HTTP_TIMEOUT)
+        resp = httpx.delete(f"{BACKEND_URL}/chat/{chat_id}", timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
         return True
     except httpx.HTTPError as exc:
@@ -99,19 +72,10 @@ def _delete_conversation(conversation_id: str) -> bool:
         return False
 
 
-def _reset_pagination() -> None:
-    st.session_state.hist_items = []
-    st.session_state.hist_page = 0
-    st.session_state.hist_has_more = True
-
-
-def _open_session(session_id: str) -> None:
-    """Switch the shared session state to another conversation and jump back to the chat page.
-
-    `history_loaded=False` forces the main page to re-fetch that session's chat/sources from the
-    backend on arrival, rather than continuing to show whatever the previously active session had.
-    """
-    st.session_state.session_id = session_id
+def _open_chat(chat_id: str, title: str) -> None:
+    """Switch the shared session state to another conversation and jump back to the chat page."""
+    st.session_state.session_id = chat_id
+    st.session_state.chat_title = title
     st.session_state.history_loaded = False
     st.session_state.chat_history = []
     st.session_state.sources = []
@@ -119,7 +83,7 @@ def _open_session(session_id: str) -> None:
 
 
 @st.dialog("Delete conversation")
-def _confirm_delete_dialog(conversation_id: str, title: str) -> None:
+def _confirm_delete_dialog(chat_id: str, title: str) -> None:
     st.warning("Are you sure you want to delete this conversation? This action cannot be undone.")
     st.caption(f'"{title}"')
     cancel_col, delete_col = st.columns(2)
@@ -128,8 +92,7 @@ def _confirm_delete_dialog(conversation_id: str, title: str) -> None:
             st.rerun()
     with delete_col:
         if st.button("🗑️ Delete", use_container_width=True, type="primary"):
-            if _delete_conversation(conversation_id):
-                _reset_pagination()
+            if _delete_chat(chat_id):
                 st.rerun()
 
 
@@ -144,76 +107,28 @@ with st.sidebar:
     st.page_link("pages/1_History.py", label="📜 History")
 
 st.markdown('<div class="welcome-title" style="font-size:1.9rem; text-align:left;">📜 Chat History</div>', unsafe_allow_html=True)
-st.caption("Every conversation you've started, across all sessions on this backend.")
+st.caption("Every conversation stored for this local user in MongoDB.")
 
 header_col, new_col = st.columns([4, 1])
 with new_col:
-    if st.button("+ New Conversation", use_container_width=True):
-        new_conversation_id = _create_conversation()
-        if new_conversation_id:
-            _open_session(new_conversation_id)
+    if st.button("+ New Chat", use_container_width=True):
+        import uuid
 
-# ----------------------------------------------------------------------------
-# Search, sort & filters
-# ----------------------------------------------------------------------------
-search = st.text_input(
-    "Search", placeholder="🔍 Search conversations by title or content...", label_visibility="collapsed"
-)
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.chat_title = "New chat"
+        st.session_state.history_loaded = True
+        st.session_state.chat_history = []
+        st.session_state.sources = []
+        st.switch_page("streamlit_app.py")
 
-sort_col, model_col, from_col, to_col = st.columns(4)
-with sort_col:
-    sort_label = st.selectbox("Sort by", list(SORT_OPTIONS.keys()))
-with model_col:
-    model_options = ["All models"] + st.session_state.hist_available_models
-    model_label = st.selectbox("Model", model_options)
-with from_col:
-    date_from = st.date_input("Created after", value=None)
-with to_col:
-    date_to = st.date_input("Created before", value=None)
+search = st.text_input("Search", placeholder="🔍 Search conversations by title...", label_visibility="collapsed")
 
-min_col, max_col = st.columns(2)
-with min_col:
-    min_tokens = st.number_input("Min total tokens", min_value=0, value=0, step=500)
-with max_col:
-    max_tokens = st.number_input("Max total tokens (0 = no limit)", min_value=0, value=0, step=500)
-
-filters = {
-    "search": search,
-    "sort": SORT_OPTIONS[sort_label],
-    "model": "" if model_label == "All models" else model_label,
-    "date_from": date_from.isoformat() if date_from else "",
-    "date_to": date_to.isoformat() if date_to else "",
-    "min_tokens": min_tokens,
-    "max_tokens": max_tokens,
-}
-filters_sig = tuple(filters.items())
-
-if filters_sig != st.session_state.hist_filters_sig:
-    st.session_state.hist_filters_sig = filters_sig
-    _reset_pagination()
-
-if not st.session_state.hist_items and st.session_state.hist_has_more:
-    result = _fetch_page(1, filters)
-    if result is not None:
-        st.session_state.hist_items = result["items"]
-        st.session_state.hist_page = 1
-        st.session_state.hist_has_more = result["has_more"]
-        st.session_state.hist_total = result["total"]
-        st.session_state.hist_available_models = result["available_models"]
-    if not st.session_state.hist_bootstrapped:
-        # First visit to the page: the filter widgets above were drawn before this fetch
-        # completed (e.g. the model dropdown had no options yet). One extra rerun lets them
-        # redraw against the now-populated session state instead of waiting for a user click.
-        st.session_state.hist_bootstrapped = True
-        st.rerun()
-
-items = st.session_state.hist_items
-filters_active = any([search, filters["model"], filters["date_from"], filters["date_to"], min_tokens, max_tokens])
+chats = _fetch_chats(st.session_state.user_id)
+if search:
+    needle = search.lower()
+    chats = [c for c in chats if needle in c["title"].lower()]
 
 
-# ----------------------------------------------------------------------------
-# Rendering helpers
-# ----------------------------------------------------------------------------
 def _format_dt(iso_string: str) -> str:
     try:
         return datetime.fromisoformat(iso_string).strftime("%b %d, %Y · %H:%M")
@@ -221,72 +136,36 @@ def _format_dt(iso_string: str) -> str:
         return iso_string
 
 
-def _format_duration(seconds: float | None) -> str:
-    if not seconds:
-        return ""
-    minutes, secs = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
-
-
-if not items:
+if not chats:
     st.markdown('<div style="margin-top:2rem;"></div>', unsafe_allow_html=True)
-    if filters_active:
-        st.caption("No conversations match your search/filters. Try adjusting them.")
-    else:
-        st.caption("No conversations yet. Start a new chat to see your history here.")
+    st.caption("No conversations match your search." if search else "No conversations yet. Start a new chat to see your history here.")
 else:
-    st.caption(f"Showing {len(items)} of {st.session_state.hist_total} conversation(s).")
+    st.caption(f"{len(chats)} conversation(s).")
     columns = st.columns(3)
-    for index, conversation in enumerate(items):
+    for index, chat in enumerate(chats):
         with columns[index % 3]:
-            badge_label = conversation["model"] or conversation["provider"]
-            badge_html = f'<span class="model-badge">{html.escape(badge_label)}</span>' if badge_label else ""
-            pin_html = '<span class="pin-badge">📌 Pinned</span>' if conversation["pinned"] else ""
-            duration_text = _format_duration(conversation["duration_seconds"])
-            duration_html = f" · {duration_text}" if duration_text else ""
-
             st.markdown(
                 f'<div class="history-card">'
-                f'<div class="history-card-badges">{badge_html}{pin_html}</div>'
-                f'<div class="history-card-title">💬 {html.escape(conversation["title"])}</div>'
-                f'<div class="history-card-meta">Created {_format_dt(conversation["created_at"])}</div>'
-                f'<div class="history-card-meta">Updated {_format_dt(conversation["updated_at"])}</div>'
-                f'<div class="history-card-meta">{conversation["message_count"]} message(s){duration_html}</div>'
-                '<div class="token-badge-row">'
-                f'<span class="token-badge">Prompt {conversation["prompt_tokens"]:,}</span>'
-                f'<span class="token-badge">Completion {conversation["completion_tokens"]:,}</span>'
-                f'<span class="token-badge">Total {conversation["total_tokens"]:,}</span>'
-                f'<span class="token-badge">Est. ${conversation["estimated_cost_usd"]:.4f}</span>'
-                "</div>"
+                f'<div class="history-card-title">💬 {html.escape(chat["title"])}</div>'
+                f'<div class="history-card-meta">Created {_format_dt(chat["created_at"])}</div>'
+                f'<div class="history-card-meta">Updated {_format_dt(chat["updated_at"])}</div>'
+                f'<div class="history-card-meta">{chat["message_count"]} message(s)</div>'
                 "</div>",
                 unsafe_allow_html=True,
             )
 
-            pin_col, view_col, delete_col = st.columns(3)
-            with pin_col:
-                pin_icon = "📌" if conversation["pinned"] else "📍"
-                if st.button(pin_icon, key=f"pin_{conversation['id']}", use_container_width=True, help="Pin/unpin"):
-                    if _update_pin(conversation["id"], not conversation["pinned"]):
-                        _reset_pagination()
-                        st.rerun()
-            with view_col:
-                if st.button("View", key=f"open_{conversation['id']}", use_container_width=True):
-                    _open_session(conversation["id"])
+            open_col, rename_col, delete_col = st.columns(3)
+            with open_col:
+                if st.button("Open", key=f"open_{chat['chat_id']}", use_container_width=True):
+                    _open_chat(chat["chat_id"], chat["title"])
+            with rename_col:
+                with st.popover("✏️ Rename", use_container_width=True):
+                    new_title = st.text_input(
+                        "New title", value=chat["title"], key=f"rename_{chat['chat_id']}", label_visibility="collapsed"
+                    )
+                    if st.button("Save", key=f"save_{chat['chat_id']}", use_container_width=True):
+                        if _rename_chat(chat["chat_id"], new_title):
+                            st.rerun()
             with delete_col:
-                if st.button("🗑️ Delete", key=f"del_{conversation['id']}", use_container_width=True):
-                    _confirm_delete_dialog(conversation["id"], conversation["title"])
-
-    if st.session_state.hist_has_more:
-        st.markdown('<div style="margin-top:0.5rem;"></div>', unsafe_allow_html=True)
-        if st.button("Load more", use_container_width=True):
-            more = _fetch_page(st.session_state.hist_page + 1, filters)
-            if more is not None:
-                st.session_state.hist_items.extend(more["items"])
-                st.session_state.hist_page += 1
-                st.session_state.hist_has_more = more["has_more"]
-            st.rerun()
+                if st.button("🗑️ Delete", key=f"del_{chat['chat_id']}", use_container_width=True):
+                    _confirm_delete_dialog(chat["chat_id"], chat["title"])

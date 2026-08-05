@@ -193,7 +193,12 @@ async def _stream_and_record(
     model_override: str | None,
     citations: list[str],
 ) -> AsyncIterator[dict[str, Any]]:
-    """Shared tail: stream tokens from the fallback-ordered LLM, then persist + emit the final event."""
+    """Shared tail: stream tokens from the fallback-ordered LLM, then emit the final event.
+
+    Persisting the resulting message is the caller's job now (`services.chat_service`, backed by
+    MongoDB) - this function only tracks token/cost usage, which stays in the SQLite session store
+    since it isn't "chat history".
+    """
     collected = ""
     provider_used = ""
     model_used = ""
@@ -213,9 +218,6 @@ async def _stream_and_record(
     output_tokens = count_tokens(collected, model_used or "gpt-4o")
     cost = estimate_cost(model_used or "", input_tokens, output_tokens)
     session.add_usage(input_tokens, output_tokens, cost, provider_used, model_used)
-    session.append_message(
-        {"role": "assistant", "content": collected, "citations": citations, "timestamp": now_iso()}
-    )
 
     yield {
         "type": "done",
@@ -223,21 +225,27 @@ async def _stream_and_record(
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost},
         "provider": provider_used,
         "model": model_used,
+        "tool_used": None,
     }
 
 
-async def stream_chat(session_id: str, question: str) -> AsyncIterator[dict[str, Any]]:
+async def stream_chat(
+    chat_id: str, question: str, history_pairs: list[tuple[str, str]]
+) -> AsyncIterator[dict[str, Any]]:
     """Run the LangGraph retrieval pipeline, then stream the grounded answer token-by-token.
 
+    `history_pairs` (most recent last) is the persistent chat history for this conversation,
+    supplied by the caller (`services.chat_service`, reading from MongoDB) - this function itself
+    holds no chat history in memory across calls.
+
     Yields dict events: {"type": "token", "data": str} while generating, then a final
-    {"type": "done", "citations": [...], "usage": {...}, "provider": str, "model": str} event,
-    or {"type": "error", "message": str} if something goes wrong.
+    {"type": "done", "citations": [...], "usage": {...}, "provider": str, "model": str,
+    "tool_used": str | None} event, or {"type": "error", "message": str} if something goes wrong.
     """
     settings = get_settings()
-    session = get_session(session_id)
-    manager = get_vector_store(session_id)
+    session = get_session(chat_id)
+    manager = get_vector_store(chat_id)
 
-    session.append_message({"role": "user", "content": question, "timestamp": now_iso()})
     preferred_provider = session.settings_overrides.get("llm_provider") or settings.llm_provider
     model_override = session.settings_overrides.get("chat_model")
 
@@ -253,12 +261,10 @@ async def stream_chat(session_id: str, question: str) -> AsyncIterator[dict[str,
         if route == "math":
             answer = await evaluate_math_query(question)
             if answer is not None:
-                session.append_message({"role": "assistant", "content": answer, "citations": [], "timestamp": now_iso()})
                 yield {"type": "token", "data": answer}
-                yield {"type": "done", "citations": [], "usage": {}, "provider": "", "model": ""}
+                yield {"type": "done", "citations": [], "usage": {}, "provider": "", "model": "", "tool_used": "calculator_mcp"}
                 return
         else:
-            history_pairs = session.chat_history_pairs(settings.max_history_turns)
             rerank_top_k_override = session.settings_overrides.get("rerank_top_k")
             source_ids = [s["id"] for s in session.sources]
 
@@ -267,26 +273,25 @@ async def stream_chat(session_id: str, question: str) -> AsyncIterator[dict[str,
                     question, history_pairs, manager, preferred_provider, rerank_top_k_override, source_ids
                 )
             except Exception as exc:  # noqa: BLE001 - surface retrieval failures cleanly to the client
-                logger.exception("Retrieval graph failed for session %s", session_id)
+                logger.exception("Retrieval graph failed for chat %s", chat_id)
                 yield {"type": "error", "message": f"Retrieval failed: {exc}"}
                 return
 
             if state["has_context"]:
                 answer = await evaluate_math_query(question, state["context"])
                 if answer is not None:
-                    session.append_message({"role": "assistant", "content": answer, "citations": state["citations"], "timestamp": now_iso()})
                     yield {"type": "token", "data": answer}
-                    yield {"type": "done", "citations": state["citations"], "usage": {}, "provider": "", "model": ""}
+                    yield {
+                        "type": "done", "citations": state["citations"], "usage": {},
+                        "provider": "", "model": "", "tool_used": "calculator_mcp",
+                    }
                     return
 
     if manager.count() == 0:
         answer = NOT_FOUND_MESSAGE
-        session.append_message({"role": "assistant", "content": answer, "citations": [], "timestamp": now_iso()})
         yield {"type": "token", "data": answer}
-        yield {"type": "done", "citations": [], "usage": {}, "provider": "", "model": ""}
+        yield {"type": "done", "citations": [], "usage": {}, "provider": "", "model": "", "tool_used": None}
         return
-
-    history_pairs = session.chat_history_pairs(settings.max_history_turns)
 
     rerank_top_k_override = session.settings_overrides.get("rerank_top_k")
     source_ids = [s["id"] for s in session.sources]
@@ -296,15 +301,14 @@ async def stream_chat(session_id: str, question: str) -> AsyncIterator[dict[str,
             question, history_pairs, manager, preferred_provider, rerank_top_k_override, source_ids
         )
     except Exception as exc:  # noqa: BLE001 - surface retrieval failures cleanly to the client
-        logger.exception("Retrieval graph failed for session %s", session_id)
+        logger.exception("Retrieval graph failed for chat %s", chat_id)
         yield {"type": "error", "message": f"Retrieval failed: {exc}"}
         return
 
     if not state["has_context"]:
         answer = NOT_FOUND_MESSAGE
-        session.append_message({"role": "assistant", "content": answer, "citations": [], "timestamp": now_iso()})
         yield {"type": "token", "data": answer}
-        yield {"type": "done", "citations": [], "usage": {}, "provider": "", "model": ""}
+        yield {"type": "done", "citations": [], "usage": {}, "provider": "", "model": "", "tool_used": None}
         return
 
     async for event in _stream_and_record(session, state["messages"], preferred_provider, model_override, state["citations"]):

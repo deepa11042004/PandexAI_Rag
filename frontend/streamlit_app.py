@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 
 import httpx
@@ -20,7 +21,8 @@ import streamlit as st
 from PIL import Image
 
 from utils.export_chat import export_chat_to_json, export_chat_to_pdf, export_chat_to_text
-from utils.helpers import format_file_size, new_id
+from utils.helpers import format_file_size
+from utils.user_store import get_or_create_user
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 HTTP_TIMEOUT = 8.0  # status/GET calls should fail fast rather than freeze the page if the backend is down
@@ -143,10 +145,40 @@ def api_delete(path: str) -> dict | None:
         return None
 
 
-def stream_chat_events(session_id: str, message: str):
-    """Yield parsed SSE event dicts from POST /chat as they arrive."""
+def api_patch(path: str, json_body: dict) -> dict | None:
+    try:
+        resp = _client().patch(path, json=json_body)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as exc:
+        st.session_state.backend_error = str(exc)
+        return None
+
+
+def fetch_chat_detail(chat_id: str) -> dict | None:
+    """GET /chat/{chat_id} (MongoDB-backed). A 404 means this chat_id has never had a message
+    sent yet (e.g. right after "+ New Chat") - that's a normal empty conversation, not an error."""
+    try:
+        resp = _client().get(f"/chat/{chat_id}")
+        if resp.status_code == 404:
+            return {"chat_id": chat_id, "title": "New chat", "messages": []}
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as exc:
+        st.session_state.backend_error = str(exc)
+        return None
+
+
+def fetch_chat_list(user_id: str) -> list[dict]:
+    result = api_get(f"/chats/{user_id}")
+    return result["chats"] if result else []
+
+
+def stream_chat_events(user_id: str, chat_id: str, question: str):
+    """Yield parsed SSE event dicts from POST /chat as they arrive (a `meta` event with the
+    resolved chat_id/title first, then `token`/`done`/`error` events)."""
     with _client().stream(
-        "POST", "/chat", json={"session_id": session_id, "message": message}, timeout=120.0
+        "POST", "/chat", json={"user_id": user_id, "chat_id": chat_id, "question": question}, timeout=120.0
     ) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -154,15 +186,37 @@ def stream_chat_events(session_id: str, message: str):
                 yield json.loads(line[len("data: ") :])
 
 
+def _messages_from_chat_detail(chat_detail: dict) -> list[dict]:
+    """Normalize MongoDB message documents (role/content/timestamp/tool_used/metadata) into the
+    flat shape `render_message`/export helpers expect (citations pulled up from metadata)."""
+    normalized = []
+    for message in chat_detail.get("messages", []):
+        metadata = message.get("metadata") or {}
+        normalized.append(
+            {
+                "role": message["role"],
+                "content": message["content"],
+                "timestamp": message.get("timestamp", ""),
+                "citations": metadata.get("citations", []),
+                "tool_used": message.get("tool_used"),
+            }
+        )
+    return normalized
+
+
 # ----------------------------------------------------------------------------
 # Session bootstrap
 # ----------------------------------------------------------------------------
 def init_state() -> None:
+    user = get_or_create_user()
     defaults = {
-        "session_id": new_id(),
+        "user_id": user["user_id"],
+        "session_id": str(uuid.uuid4()),  # current chat_id - a fresh, not-yet-created chat
         "theme": "dark",
         "backend_error": None,
         "chat_history": [],
+        "chat_title": "New chat",
+        "chat_list": [],
         "sources": [],
         "history_loaded": False,
     }
@@ -173,19 +227,38 @@ def init_state() -> None:
 
 init_state()
 
-# Session identity lives purely in st.session_state, not the URL - a browser refresh gets a
-# brand-new session_id (empty chat) rather than resurrecting whatever was last active. Jumping
-# to a specific past conversation (Chat History page's "View") sets session_id/history_loaded
-# directly before switching pages, so it doesn't depend on a `sid` query param round-trip either.
+
+def start_new_chat() -> None:
+    """A brand-new, empty conversation - not persisted in MongoDB until the first message is
+    sent (mirrors ChatGPT: clicking "New Chat" doesn't itself create a history entry)."""
+    st.session_state.session_id = str(uuid.uuid4())
+    st.session_state.chat_history = []
+    st.session_state.chat_title = "New chat"
+    st.session_state.sources = []
+    st.session_state.history_loaded = True  # nothing to fetch - it's known to be empty
+
+
+def open_chat(chat_id: str, title: str = "") -> None:
+    st.session_state.session_id = chat_id
+    st.session_state.chat_title = title or "New chat"
+    st.session_state.chat_history = []
+    st.session_state.sources = []
+    st.session_state.history_loaded = False
+
+
+# A browser refresh keeps the same chat_id (session_state resets, but `user_id` is re-read from
+# the on-disk file and `session_id` regenerates to a fresh empty chat) - past conversations are
+# only reached via the sidebar chat list below, exactly like the previous session_id behavior.
 if not st.session_state.history_loaded:
     # Only mark this done once both calls actually succeed - flipping the flag unconditionally
     # meant a single transient failure (e.g. the backend still busy loading its embedding model
     # right after a restart) permanently stuck the sidebar on "Sources: 0" for the rest of the
     # browser session, even once the backend was back up and the data was there all along.
-    history = api_get(f"/chat/{st.session_state.session_id}/history")
+    chat_detail = fetch_chat_detail(st.session_state.session_id)
     sources = api_get(f"/sources/{st.session_state.session_id}")
-    if history is not None and sources is not None:
-        st.session_state.chat_history = history["messages"]
+    if chat_detail is not None and sources is not None:
+        st.session_state.chat_history = _messages_from_chat_detail(chat_detail)
+        st.session_state.chat_title = chat_detail.get("title", "New chat")
         st.session_state.sources = sources["sources"]
         st.session_state.history_loaded = True
 
@@ -238,19 +311,15 @@ def render_sidebar() -> None:
         st.page_link("streamlit_app.py", label="💬 Chat")
         st.page_link("pages/1_History.py", label="📜 History")
 
-        theme_col, clear_col = st.columns(2)
+        theme_col, new_chat_col = st.columns(2)
         with theme_col:
             if st.button("🌗 Theme", use_container_width=True):
                 st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
                 st.rerun()
-        with clear_col:
-            if st.button("🗑️ Clear Chat", use_container_width=True, disabled=not st.session_state.chat_history):
-                result = api_delete(f"/chat/{st.session_state.session_id}")
-                if result is None:
-                    st.error(f"Could not clear chat: {st.session_state.backend_error or 'backend unreachable'}")
-                else:
-                    st.session_state.chat_history = []
-                    st.rerun()
+        with new_chat_col:
+            if st.button("+ New Chat", use_container_width=True, type="primary"):
+                start_new_chat()
+                st.rerun()
 
         st.markdown('<div class="sidebar-section-title">Backend Connection</div>', unsafe_allow_html=True)
         health = api_get("/health")
@@ -485,10 +554,46 @@ def _handle_ingest_result(result: dict | None) -> None:
         st.error(result["message"])
 
 
+MAX_CHATS_IN_SIDEBAR = 8
+
+
 def render_chat_history_panel() -> None:
-    st.markdown('<div class="sidebar-section-title">Chat History</div>', unsafe_allow_html=True)
-    if st.button("📜 View All Conversations", use_container_width=True):
-        st.switch_page("pages/1_History.py")
+    st.markdown('<div class="sidebar-section-title">Chats</div>', unsafe_allow_html=True)
+
+    chats = fetch_chat_list(st.session_state.user_id)
+    st.session_state.chat_list = chats
+
+    if not chats:
+        st.caption("No conversations yet - send a message to start one.")
+    for chat in chats[:MAX_CHATS_IN_SIDEBAR]:
+        is_active = chat["chat_id"] == st.session_state.session_id
+        open_col, rename_col, delete_col = st.columns([5, 1, 1])
+        with open_col:
+            label = ("🟢 " if is_active else "💬 ") + chat["title"]
+            if st.button(label, key=f"open_{chat['chat_id']}", use_container_width=True, help=chat["title"]):
+                open_chat(chat["chat_id"], chat["title"])
+                st.rerun()
+        with rename_col:
+            with st.popover("✏️", use_container_width=True):
+                new_title = st.text_input(
+                    "Rename chat", value=chat["title"], key=f"rename_input_{chat['chat_id']}",
+                    label_visibility="collapsed",
+                )
+                if st.button("Save", key=f"rename_save_{chat['chat_id']}", use_container_width=True):
+                    if api_patch(f"/chat/{chat['chat_id']}", {"title": new_title}) is not None:
+                        if is_active:
+                            st.session_state.chat_title = new_title
+                        st.rerun()
+        with delete_col:
+            if st.button("🗑️", key=f"del_{chat['chat_id']}", use_container_width=True, help="Delete this chat"):
+                if api_delete(f"/chat/{chat['chat_id']}") is not None:
+                    if is_active:
+                        start_new_chat()
+                    st.rerun()
+
+    if len(chats) > MAX_CHATS_IN_SIDEBAR or chats:
+        if st.button("📜 View All Conversations", use_container_width=True):
+            st.switch_page("pages/1_History.py")
 
 
 def render_usage_panel() -> None:
@@ -593,7 +698,13 @@ def _render_markdown_lite(content: str) -> str:
     return "".join(segments)
 
 
-def render_message(role: str, content: str, citations: list[str] | None = None, timestamp: str = "") -> None:
+def render_message(
+    role: str,
+    content: str,
+    citations: list[str] | None = None,
+    timestamp: str = "",
+    tool_used: str | None = None,
+) -> None:
     row_class = "user" if role == "user" else "ai"
     align = "flex-end" if role == "user" else "flex-start"
     safe_content = _render_markdown_lite(content)
@@ -602,6 +713,8 @@ def render_message(role: str, content: str, citations: list[str] | None = None, 
     if citations:
         pills = "".join(f'<span class="citation-pill">📎 {html.escape(c)}</span>' for c in citations)
         citation_html = f"<div>{pills}</div>"
+    if tool_used == "calculator_mcp":
+        citation_html += '<div><span class="citation-pill">🧮 Calculator MCP</span></div>'
 
     # Single line, no embedded newlines/indentation: a multi-line triple-quoted f-string here
     # previously left trailing indented "</div>" lines that Streamlit's markdown parser could
@@ -647,7 +760,7 @@ def render_welcome() -> None:
 
 
 def handle_query(prompt: str) -> None:
-    st.session_state.chat_history.append({"role": "user", "content": prompt, "citations": [], "timestamp": ""})
+    st.session_state.chat_history.append({"role": "user", "content": prompt, "citations": [], "timestamp": "", "tool_used": None})
     render_message("user", prompt)
 
     # Keep the placeholder's HTML structure identical across every update (loading -> streaming) -
@@ -664,15 +777,22 @@ def handle_query(prompt: str) -> None:
 
     collected = ""
     citations: list[str] = []
+    tool_used: str | None = None
     error_message: str | None = None
     try:
-        for event in stream_chat_events(st.session_state.session_id, prompt):
-            if event["type"] == "token":
+        for event in stream_chat_events(st.session_state.user_id, st.session_state.session_id, prompt):
+            if event["type"] == "meta":
+                # First message in a brand-new chat resolves/auto-titles it server-side - reflect
+                # that immediately so the sidebar's active-chat highlight/title stay in sync.
+                st.session_state.session_id = event["chat_id"]
+                st.session_state.chat_title = event.get("title", st.session_state.chat_title)
+            elif event["type"] == "token":
                 collected += event["data"]
                 safe = html.escape(collected).replace("\n", "<br>")
                 _render_bubble(placeholder, f"{safe}▌")
             elif event["type"] == "done":
                 citations = event.get("citations", [])
+                tool_used = event.get("tool_used")
             elif event["type"] == "error":
                 error_message = event["message"]
     except httpx.HTTPError as exc:
@@ -680,9 +800,9 @@ def handle_query(prompt: str) -> None:
 
     placeholder.empty()
     answer = error_message or collected or "No response received."
-    render_message("assistant", answer, citations=citations)
+    render_message("assistant", answer, citations=citations, tool_used=tool_used)
     st.session_state.chat_history.append(
-        {"role": "assistant", "content": answer, "citations": citations, "timestamp": ""}
+        {"role": "assistant", "content": answer, "citations": citations, "timestamp": "", "tool_used": tool_used}
     )
 
 
@@ -698,7 +818,8 @@ with chat_container:
     else:
         for message in st.session_state.chat_history:
             render_message(
-                message["role"], message["content"], message.get("citations"), message.get("timestamp", "")
+                message["role"], message["content"], message.get("citations"),
+                message.get("timestamp", ""), message.get("tool_used"),
             )
 
 submission = st.chat_input("Ask a question about your documents... (or use the mic)", accept_audio=True)

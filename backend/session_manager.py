@@ -1,10 +1,11 @@
-"""Per-session persistence: source metadata, chat history, token usage, and settings.
+"""Per-session persistence: source metadata, token usage, and settings overrides - everything
+about a chat *except* the chat/message history itself, which lives in MongoDB (see
+`backend/database/`) and is keyed by the same id (`chat_id` there, `session_id` here).
 
-Backed by a single SQLite database (`.sessions/history.db`, one row per conversation in the
-`conversations` table - see `backend.history_store` for the table DDL and the list/search/filter
-query surface used by the chat-history page). A short-lived connection is opened per operation
-(WAL mode + a busy timeout) rather than held open, which is simple and safe across FastAPI's
-threadpool without any manual locking.
+Backed by a single SQLite database (`.sessions/history.db`, one row per id in the `conversations`
+table - see `backend.history_store` for the table DDL). A short-lived connection is opened per
+operation (WAL mode + a busy timeout) rather than held open, which is simple and safe across
+FastAPI's threadpool without any manual locking.
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ def connect() -> sqlite3.Connection:
 def _default_state() -> dict[str, Any]:
     return {
         "sources": [],  # list[SourceInfo-shaped dict]
-        "chat_history": [],  # list[ChatMessage-shaped dict]
         "settings": {},  # SessionSettings-shaped dict, sparse overrides only
         "usage": {
             "input_tokens": 0,
@@ -63,7 +63,6 @@ def derive_title(chat_history: list[dict]) -> str:
 def _row_to_state(row: sqlite3.Row) -> dict[str, Any]:
     state = _default_state()
     state["sources"] = json.loads(row["sources"] or "[]")
-    state["chat_history"] = json.loads(row["messages"] or "[]")
     state["settings"] = json.loads(row["settings"] or "{}")
     state["usage"] = {
         "input_tokens": row["prompt_tokens"],
@@ -93,7 +92,10 @@ class SessionManager:
 
     def save(self) -> None:
         created_at = self._created_at or now_iso()
-        title = derive_title(self._state["chat_history"])
+        # title/messages/message_count are vestigial now that MongoDB owns chat history (see
+        # `database/repository.ChatRepository`) - kept as fixed placeholders rather than dropping
+        # the columns, since this same row still needs to exist for sources/usage/settings.
+        title = "Untitled conversation"
         usage = self._state["usage"]
         with connect() as conn:
             conn.execute(
@@ -114,8 +116,7 @@ class SessionManager:
                     self.session_id, title, created_at, now_iso(), int(self._pinned),
                     usage["last_provider"], usage["last_model"],
                     usage["input_tokens"], usage["output_tokens"], usage["estimated_cost_usd"],
-                    len(self._state["chat_history"]),
-                    json.dumps(self._state["chat_history"], ensure_ascii=False),
+                    0, "[]",
                     json.dumps(self._state["sources"], ensure_ascii=False),
                     json.dumps(self._state["settings"], ensure_ascii=False),
                 ),
@@ -142,32 +143,6 @@ class SessionManager:
 
     def known_content_hashes(self) -> set[str]:
         return {s["content_hash"] for s in self._state["sources"] if s.get("content_hash")}
-
-    # --- chat ----------------------------------------------------------------------
-    @property
-    def chat_history(self) -> list[dict]:
-        return self._state["chat_history"]
-
-    def chat_history_pairs(self, max_turns: int) -> list[tuple[str, str]]:
-        """Recent (question, answer) tuples for conversation memory, most recent last."""
-        messages = self._state["chat_history"]
-        pairs: list[tuple[str, str]] = []
-        pending_question: str | None = None
-        for msg in messages:
-            if msg["role"] == "user":
-                pending_question = msg["content"]
-            elif msg["role"] == "assistant" and pending_question is not None:
-                pairs.append((pending_question, msg["content"]))
-                pending_question = None
-        return pairs[-max_turns:]
-
-    def append_message(self, message: dict) -> None:
-        self._state["chat_history"].append(message)
-        self.save()
-
-    def clear_chat(self) -> None:
-        self._state["chat_history"] = []
-        self.save()
 
     # --- usage -----------------------------------------------------------------------
     @property

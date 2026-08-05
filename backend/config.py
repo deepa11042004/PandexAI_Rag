@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     uploads_dir: str = "uploads"
     sessions_dir: str = ".sessions"
 
+    # --- MongoDB (persistent chat history: users/chats/messages) -------------------
+    # The only source of truth for chat/message history - see backend/database/.
+    mongodb_uri: str = "mongodb://localhost:27017"
+    mongodb_db_name: str = "PandexAI"
+
     # --- RAG tuning ----------------------------------------------------------------
     chunk_size: int = 1000
     chunk_overlap: int = 150

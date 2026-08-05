@@ -5,28 +5,22 @@ Run with (from inside this backend/ folder): uvicorn main:app --reload
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 import history_store
 import rag_pipeline
+from api.chat_routes import router as chat_router
 from config import get_settings
+from database.mongodb import close_mongo_connection, connect_to_mongo
 from llm_provider import fallback_order, transcribe_audio, validate_api_key
 from models import (
     AddUrlRequest,
     AddYoutubeRequest,
-    ChatHistoryResponse,
-    ChatMessage,
-    ChatRequest,
-    ConversationDetail,
-    ConversationListResponse,
-    ConversationSummary,
-    ConversationUpdateRequest,
     IngestResponse,
     SessionSettings,
     SourceInfo,
@@ -49,6 +43,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(chat_router)
+
 
 @app.on_event("startup")
 async def on_startup() -> None:
@@ -58,6 +54,10 @@ async def on_startup() -> None:
 
     await run_in_threadpool(history_store.init_db)
     await run_in_threadpool(history_store.migrate_legacy_json_sessions)
+
+    # MongoDB is the only source of truth for chat/message history - fail fast at startup rather
+    # than surfacing a confusing error on the user's first chat message.
+    await run_in_threadpool(connect_to_mongo)
 
     logger.info("Backend started. Provider order: %s", settings.llm_provider)
 
@@ -69,6 +69,11 @@ async def on_startup() -> None:
         logger.info("Warming local embedding model...")
         await run_in_threadpool(lambda: get_embeddings_client().embed_query("warmup"))
         logger.info("Local embedding model ready.")
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    await run_in_threadpool(close_mongo_connection)
 
 
 @app.get("/health")
@@ -96,60 +101,6 @@ async def providers() -> dict:
         "embedding_provider": settings.embedding_provider,
         "embeddings_ready": settings.embedding_provider == "local" or bool(settings.openai_api_key),
     }
-
-
-# ----------------------------------------------------------------------------
-# Chat history page: search/sort/filter/paginate past conversations, view one in full,
-# create/pin/delete. Metadata-only list (no message bodies) for a cheap list call; the full
-# conversation (including messages) is only fetched on GET /api/chat-history/{id} ("View").
-# ----------------------------------------------------------------------------
-@app.get("/api/chat-history", response_model=ConversationListResponse)
-async def list_chat_history(
-    search: str = "",
-    sort: str = "updated",
-    model: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    min_tokens: int = 0,
-    max_tokens: int = 0,
-    page: int = 1,
-    page_size: int = 9,
-) -> ConversationListResponse:
-    result = await run_in_threadpool(
-        history_store.list_conversations,
-        search, sort, model, date_from, date_to, min_tokens, max_tokens, page, page_size,
-    )
-    return ConversationListResponse(items=[ConversationSummary(**s) for s in result["items"]], **{
-        k: v for k, v in result.items() if k != "items"
-    })
-
-
-@app.get("/api/chat-history/{session_id}", response_model=ConversationDetail)
-async def get_chat_history_item(session_id: str) -> ConversationDetail:
-    conversation = await run_in_threadpool(history_store.get_conversation, session_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return ConversationDetail(**conversation)
-
-
-@app.post("/api/chat-history", response_model=ConversationSummary)
-async def create_chat_history_item() -> ConversationSummary:
-    conversation = await run_in_threadpool(history_store.create_conversation)
-    return ConversationSummary(**conversation)
-
-
-@app.put("/api/chat-history/{session_id}", response_model=ConversationSummary)
-async def update_chat_history_item(session_id: str, payload: ConversationUpdateRequest) -> ConversationSummary:
-    conversation = await run_in_threadpool(history_store.update_conversation, session_id, payload.pinned)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return ConversationSummary(**conversation)
-
-
-@app.delete("/api/chat-history/{session_id}")
-async def delete_chat_history_item(session_id: str) -> dict:
-    await run_in_threadpool(rag_pipeline.delete_session, session_id)
-    return {"success": True}
 
 
 # ----------------------------------------------------------------------------
@@ -212,34 +163,8 @@ async def delete_all_sources(session_id: str) -> dict:
     return {"success": True}
 
 
-# ----------------------------------------------------------------------------
-# Chat
-# ----------------------------------------------------------------------------
-@app.get("/chat/{session_id}/history", response_model=ChatHistoryResponse)
-async def chat_history(session_id: str) -> ChatHistoryResponse:
-    messages = get_session(session_id).chat_history
-    return ChatHistoryResponse(session_id=session_id, messages=[ChatMessage(**m) for m in messages])
-
-
-@app.delete("/chat/{session_id}")
-async def clear_chat(session_id: str) -> dict:
-    get_session(session_id).clear_chat()
-    return {"success": True}
-
-
-@app.post("/chat")
-async def chat(payload: ChatRequest) -> StreamingResponse:
-    """Server-Sent Events stream: one `data: {...}` line per token, then a final `done` event."""
-
-    async def event_stream():
-        try:
-            async for event in rag_pipeline.stream_chat(payload.session_id, payload.message):
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as exc:  # noqa: BLE001 - never let an unhandled error hang the stream
-            logger.exception("Unhandled error streaming chat for session %s", payload.session_id)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+# Chat endpoints (POST /chat, GET/PATCH/DELETE /chat/{chat_id}, GET /chats/{user_id}) are mounted
+# via `api.chat_routes.router` above - MongoDB-backed, see services/chat_service.py.
 
 
 def _wav_loudness(raw_bytes: bytes) -> str:

@@ -1,9 +1,8 @@
-"""Chat-history page backing store: schema setup, one-time legacy-JSON migration, and the
-search/sort/filter/paginate query surface behind `GET /api/chat-history`.
+"""SQLite schema setup + one-time legacy-JSON migration for the `conversations` table.
 
-Reads/writes the same `conversations` SQLite table that `backend.session_manager.SessionManager`
-uses for per-session read/write during chat - this module is purely the list-oriented query layer
-on top of it, so there's exactly one source of truth for conversation data.
+Chat/message history now lives in MongoDB (see `backend/database/`) - this table is only used by
+`backend.session_manager.SessionManager` for the non-chat-history parts of a conversation (sources,
+token usage, per-chat settings overrides), keyed by the same id as the Mongo `chat_id`.
 """
 
 from __future__ import annotations
@@ -11,20 +10,12 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any
 
 from config import get_settings
 from session_manager import connect, derive_title, db_path
-from utils.helpers import new_id, now_iso
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-_SORT_COLUMNS = {
-    "newest": "created_at DESC",
-    "oldest": "created_at ASC",
-    "updated": "updated_at DESC",
-}
 
 
 def init_db() -> None:
@@ -81,7 +72,7 @@ def migrate_legacy_json_sessions() -> None:
             chat_history = data.get("chat_history", [])
             usage = data.get("usage", {})
             stat = path.stat()
-            created_at = now_iso() if stat.st_ctime <= 0 else _iso_from_epoch(stat.st_ctime)
+            created_at = _iso_from_epoch(stat.st_ctime) if stat.st_ctime > 0 else _iso_from_epoch(stat.st_mtime)
             updated_at = _iso_from_epoch(stat.st_mtime)
 
             try:
@@ -120,146 +111,4 @@ def _iso_from_epoch(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
 
 
-def _row_to_summary(row: Any) -> dict[str, Any]:
-    prompt_tokens = row["prompt_tokens"]
-    completion_tokens = row["completion_tokens"]
-    duration_seconds: float | None = None
-    if row["message_count"] > 1:
-        from datetime import datetime
-
-        try:
-            delta = datetime.fromisoformat(row["updated_at"]) - datetime.fromisoformat(row["created_at"])
-            duration_seconds = max(delta.total_seconds(), 0.0)
-        except ValueError:
-            duration_seconds = None
-
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        "pinned": bool(row["pinned"]),
-        "provider": row["provider"],
-        "model": row["model"],
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-        "estimated_cost_usd": row["estimated_cost_usd"],
-        "message_count": row["message_count"],
-        "duration_seconds": duration_seconds,
-    }
-
-
-_SUMMARY_COLUMNS = (
-    "id, title, created_at, updated_at, pinned, provider, model, "
-    "prompt_tokens, completion_tokens, estimated_cost_usd, message_count"
-)
-
-
-def list_conversations(
-    search: str = "",
-    sort: str = "updated",
-    model: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    min_tokens: int = 0,
-    max_tokens: int = 0,
-    page: int = 1,
-    page_size: int = 9,
-) -> dict[str, Any]:
-    where = ["message_count > 0"]
-    params: list[Any] = []
-
-    if search:
-        where.append("(LOWER(title) LIKE ? OR LOWER(messages) LIKE ?)")
-        needle = f"%{search.lower()}%"
-        params.extend([needle, needle])
-    if model:
-        where.append("model = ?")
-        params.append(model)
-    if date_from:
-        where.append("created_at >= ?")
-        params.append(date_from)
-    if date_to:
-        where.append("created_at <= ?")
-        params.append(date_to + "T23:59:59")
-    if min_tokens:
-        where.append("(prompt_tokens + completion_tokens) >= ?")
-        params.append(min_tokens)
-    if max_tokens:
-        where.append("(prompt_tokens + completion_tokens) <= ?")
-        params.append(max_tokens)
-
-    where_sql = " AND ".join(where)
-    order_sql = _SORT_COLUMNS.get(sort, _SORT_COLUMNS["updated"])
-    page = max(page, 1)
-    page_size = max(page_size, 1)
-    offset = (page - 1) * page_size
-
-    with connect() as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM conversations WHERE {where_sql}", params).fetchone()[0]
-        rows = conn.execute(
-            f"SELECT {_SUMMARY_COLUMNS} FROM conversations WHERE {where_sql} "
-            f"ORDER BY pinned DESC, {order_sql} LIMIT ? OFFSET ?",
-            [*params, page_size, offset],
-        ).fetchall()
-        available_models = [
-            r[0] for r in conn.execute(
-                "SELECT DISTINCT model FROM conversations WHERE model != '' AND message_count > 0 ORDER BY model"
-            ).fetchall()
-        ]
-
-    items = [_row_to_summary(row) for row in rows]
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "has_more": offset + len(items) < total,
-        "available_models": available_models,
-    }
-
-
-def get_conversation(session_id: str) -> dict[str, Any] | None:
-    with connect() as conn:
-        row = conn.execute("SELECT * FROM conversations WHERE id = ?", (session_id,)).fetchone()
-    if row is None:
-        return None
-    summary = _row_to_summary(row)
-    summary["messages"] = json.loads(row["messages"] or "[]")
-    return summary
-
-
-def create_conversation() -> dict[str, Any]:
-    session_id = new_id()
-    timestamp = now_iso()
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (session_id, "Untitled conversation", timestamp, timestamp),
-        )
-        conn.commit()
-    return get_conversation(session_id)  # type: ignore[return-value]
-
-
-def update_conversation(session_id: str, pinned: bool | None) -> dict[str, Any] | None:
-    if pinned is None:
-        return get_conversation(session_id)
-    with connect() as conn:
-        cursor = conn.execute(
-            "UPDATE conversations SET pinned = ? WHERE id = ?", (int(pinned), session_id)
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            return None
-    return get_conversation(session_id)
-
-
-__all__ = [
-    "init_db",
-    "migrate_legacy_json_sessions",
-    "list_conversations",
-    "get_conversation",
-    "create_conversation",
-    "update_conversation",
-]
+__all__ = ["init_db", "migrate_legacy_json_sessions"]

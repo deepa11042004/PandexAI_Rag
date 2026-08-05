@@ -9,3 +9,4 @@ logs/
 .streamlit/secrets.toml
 venv/
 .claude/
+frontend/.local_user.json
